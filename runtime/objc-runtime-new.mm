@@ -48,10 +48,6 @@ extern "C" {
 }
 #endif // !TARGET_OS_EXCLAVEKIT
 
-#if !TARGET_OS_EXCLAVECORE && !TARGET_OS_EXCLAVEKIT
-#include <malloc_private.h>
-#endif // !TARGET_OS_EXCLAVECORE && !TARGET_OS_EXCLAVEKIT
-
 #define newprotocol(p) ((protocol_t *)p)
 
 static void disableTaggedPointers();
@@ -90,12 +86,12 @@ static void attachCategories(Class cls, const struct locstamped_category_t *cats
 /***********************************************************************
 * Lock management
 **********************************************************************/
-ExplicitInitLock<mutex_t> runtimeLock;
-ExplicitInitLock<mutex_t> selLock;
+mutex_t runtimeLock;
+mutex_t selLock;
 #if CONFIG_USE_CACHE_LOCK
-ExplicitInitLock<mutex_t> cacheUpdateLock;
+mutex_t cacheUpdateLock;
 #endif
-ExplicitInitLock<recursive_mutex_t> loadMethodLock;
+recursive_mutex_t loadMethodLock;
 
 /***********************************************************************
 * Class structure decoding
@@ -180,6 +176,7 @@ static constexpr T coveringMask(T n) {
     }
     return ~T{0};
 }
+const uintptr_t objc_debug_isa_class_mask  = ISA_MASK & coveringMask(OBJC_VM_MAX_ADDRESS - 1);
 
 const uintptr_t objc_debug_isa_magic_mask  = ISA_MAGIC_MASK;
 const uintptr_t objc_debug_isa_magic_value = ISA_MAGIC_VALUE;
@@ -191,15 +188,8 @@ STATIC_ASSERT((ISA_MASK & ISA_MAGIC_MASK) == 0);
 STATIC_ASSERT((~ISA_MAGIC_MASK & ISA_MAGIC_VALUE) == 0);
 
 // die if virtual address space bound goes up
-STATIC_ASSERT((~ISA_MASK & OBJC_VM_MAX_ADDRESS) == 0  ||
-              ISA_MASK + sizeof(void*) == OBJC_VM_MAX_ADDRESS);
-
-#if TARGET_OS_EXCLAVEKIT
-// Initialize to value that might hopefully produce recognizable failures if used before properly initialized.
-uintptr_t objc_debug_isa_class_mask = 0xffff;
-#else
-const uintptr_t objc_debug_isa_class_mask = ISA_MASK & coveringMask(OBJC_VM_MAX_ADDRESS - 1);
-#endif
+//STATIC_ASSERT((~ISA_MASK & OBJC_VM_MAX_ADDRESS) == 0  ||
+//              ISA_MASK + sizeof(void*) == OBJC_VM_MAX_ADDRESS);
 
 // SUPPORT_PACKED_ISA
 #else
@@ -212,17 +202,6 @@ const uintptr_t objc_debug_isa_magic_value = 0;
 
 // not SUPPORT_PACKED_ISA
 #endif
-
-extern void masks_init(void) {
-#if TARGET_OS_EXCLAVEKIT
-    // Start with the mask we would compute from OBJC_VM_MAX_ADDRESS, then
-    // strip it to shrink it in the case where the ptrauth signature takes more
-    // bits than we thought it did because the address space is smaller.
-    void *initialMask = (void *)(ISA_MASK & coveringMask(OBJC_VM_MAX_ADDRESS - 1));
-    void *strippedMask = ptrauth_strip(initialMask, ptrauth_key_process_independent_data);
-    objc_debug_isa_class_mask = (uintptr_t)strippedMask;
-#endif
-}
 
 // We use a *signed* "pointer" to control enforcement.  It's signed so that
 // an attacker can't just overwrite it with some random thing to turn off
@@ -292,7 +271,7 @@ namespace objc {
 }
 
 static IMP method_t_remappedImp_nolock(const method_t *m) {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
     auto *map = objc::smallMethodIMPMap.get(false);
     if (!map)
         return nullptr;
@@ -312,14 +291,14 @@ IMP method_t::remappedImp(bool needsLock) const {
         mutex_locker_t guard(runtimeLock);
         return method_t_remappedImp_nolock(this);
     } else {
-        lockdebug::assert_locked(&runtimeLock.get());
+        lockdebug::assert_locked(&runtimeLock);
         return method_t_remappedImp_nolock(this);
     }
 }
 
 void method_t::remapImp(IMP imp) {
     ASSERT(getKind() == Kind::small);
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     auto *map = objc::smallMethodIMPMap.get(true);
     (*map)[this] = bitcast_auth_and_resign(void *, imp,
@@ -342,7 +321,7 @@ objc_method_description *method_t::getCachedDescription() const {
 }
 
 void method_t::tryFreeContents_nolock() {
-    assert_locked(&runtimeLock.get());
+    assert_locked(&runtimeLock);
     try_free(types());
     if (auto *map = objc::methodDescriptionMap.get(false))
         map->erase(this);
@@ -392,7 +371,7 @@ bool method_list_t::isFixedUp() const {
 }
 
 void method_list_t::setFixedUp() {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
     ASSERT(!isFixedUp());
     entsizeAndFlags = entsizeAndFlags| fixed_up_method_list;
 }
@@ -402,7 +381,7 @@ bool protocol_t::isFixedUp() const {
 }
 
 void protocol_t::setFixedUp() {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
     ASSERT(!isFixedUp());
     flags = (flags & ~PROTOCOL_FIXED_UP_MASK) | fixed_up_protocol;
 }
@@ -412,7 +391,7 @@ bool protocol_t::isCanonical() const {
 }
 
 void protocol_t::clearIsCanonical() {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
     ASSERT(isCanonical());
     flags = flags & ~canonical_protocol;
 }
@@ -473,7 +452,7 @@ alloc_class_for_subclass(Class supercls, size_t extraBytes)
     swift_class_t *swiftSupercls = (swift_class_t *)supercls;
     size_t superSize = swiftSupercls->classSize;
     void *superBits = swiftSupercls->baseAddress();
-    void *bits = _calloc_class(superSize + extraBytes);
+    void *bits = malloc(superSize + extraBytes);
 
     // Copy all of the superclass's data to the new class.
     memcpy(bits, superBits, superSize);
@@ -518,7 +497,7 @@ void *object_getIndexedIvars(id obj)
 **********************************************************************/
 static class_ro_t *make_ro_writeable(class_rw_t *rw)
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     if (rw->flags & RW_COPIED_RO) {
         // already writeable, do nothing
@@ -582,7 +561,7 @@ isKnownClass(Class cls)
 static void
 addClassTableEntry(Class cls, bool addMeta = true)
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     // This class is allowed to be a known class via the shared cache or via
     // data segments, but it is not allowed to be in the dynamic table already.
@@ -699,7 +678,7 @@ printReplacements(Class cls, const locstamped_category_t *cats_list, uint32_t ca
 **********************************************************************/
 static unsigned unreasonableClassCount()
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     int base = NXCountMapTable(gdb_objc_realized_classes) +
     getPreoptimizedClassUnreasonableCount();
@@ -723,7 +702,7 @@ foreach_realized_class_and_subclass_2(Class top, unsigned &count,
 {
     Class cls = top;
 
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
     ASSERT(top);
 
     while (1) {
@@ -1336,7 +1315,7 @@ class UnattachedCategories : public ExplicitInitDenseMap<Class, category_list>
 public:
     void addForClass(locstamped_category_t lc, Class cls)
     {
-        lockdebug::assert_locked(&runtimeLock.get());
+        lockdebug::assert_locked(&runtimeLock);
 
         if (slowpath(PrintConnecting)) {
             _objc_inform("CLASS: found category %c%s(%s)",
@@ -1352,7 +1331,7 @@ public:
 
     void attachToClass(Class cls, Class previously, int flags)
     {
-        lockdebug::assert_locked(&runtimeLock.get());
+        lockdebug::assert_locked(&runtimeLock);
         ASSERT((flags & ATTACH_CLASS) ||
                (flags & ATTACH_METACLASS) ||
                (flags & ATTACH_CLASS_AND_METACLASS));
@@ -1375,7 +1354,7 @@ public:
 
     void eraseCategoryForClass(category_t *cat, Class cls)
     {
-        lockdebug::assert_locked(&runtimeLock.get());
+        lockdebug::assert_locked(&runtimeLock);
 
         auto &map = get();
         auto it = map.find(cls);
@@ -1390,7 +1369,7 @@ public:
 
     void eraseClass(Class cls)
     {
-        lockdebug::assert_locked(&runtimeLock.get());
+        lockdebug::assert_locked(&runtimeLock);
 
         get().erase(cls);
     }
@@ -1409,7 +1388,7 @@ static bool isBundleClass(Class cls)
 static void
 fixupMethodList(method_list_t *mlist, bool bundleCopy, bool sort)
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
     ASSERT(!mlist->isFixedUp());
 
     // Skip empty lists. This is a workaround for empty lists embedded in
@@ -1448,7 +1427,7 @@ static void
 prepareMethodLists(Class cls, method_list_t **addedLists, int addedCount,
                    bool baseMethods, bool methodsFromBundle, const char *why)
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     if (addedCount == 0) return;
 
@@ -1495,7 +1474,7 @@ prepareMethodLists(Class cls, method_list_t **addedLists, int addedCount,
 class_rw_ext_t *
 class_rw_t::extAlloc(const class_ro_t *ro, bool deepCopy)
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     auto rwe = objc::zalloc<class_rw_ext_t>();
 
@@ -1648,7 +1627,7 @@ attachCategories(Class cls, const locstamped_category_t *cats_list, uint32_t cat
 **********************************************************************/
 static void methodizeClass(Class cls, Class previously)
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     bool isMeta = cls->isMetaClass();
     auto rw = cls->data();
@@ -1703,19 +1682,6 @@ static void methodizeClass(Class cls, Class previously)
         const unsigned threshold = 100;
         const unsigned proportion = 2;
         if (listList->count >= threshold && numLoaded <= listList->count / proportion) {
-            if (PrintConnecting) {
-                _objc_inform("CLASS: Copying preoptimized categories for "
-                             "sparsely loaded class '%s' %s - %u lists, "
-                             "%u loaded - loaded lists are:",
-                             cls->nameForLogging(), isMeta ? "(meta)" : "",
-                             listList->count, numLoaded);
-                iter = listList->beginLists();
-                end = listList->endLists();
-                while (iter != end) {
-                    _objc_inform("    %p", *iter);
-                    ++iter;
-                }
-            }
             rw->extAllocIfNeeded()->methods.copyListList(numLoaded);
         }
     }
@@ -1774,7 +1740,7 @@ static void methodizeClass(Class cls, Class previously)
 static NXMapTable *nonmeta_class_map = nil;
 static NXMapTable *nonMetaClasses(void)
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     if (nonmeta_class_map) return nonmeta_class_map;
 
@@ -1794,7 +1760,7 @@ static NXMapTable *nonMetaClasses(void)
 **********************************************************************/
 static void addNonMetaClass(Class cls)
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
     void *old;
     old = NXMapInsert(nonMetaClasses(), cls->ISA(), cls);
 
@@ -1806,7 +1772,7 @@ static void addNonMetaClass(Class cls)
 
 static void removeNonMetaClass(Class cls)
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
     NXMapRemove(nonMetaClasses(), cls->ISA());
 }
 
@@ -2021,7 +1987,7 @@ static Class getClassFromNamedClassTable(const char *name) {
 
 static Class getClass_impl(const char *name)
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     // allocated in _read_images
     ASSERT(gdb_objc_realized_classes);
@@ -2041,7 +2007,7 @@ static Class getClass_impl(const char *name)
 
 static Class getClassExceptSomeSwift(const char *name)
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     // Try name as-is
     Class result = getClass_impl(name);
@@ -2066,7 +2032,7 @@ static Class getClassExceptSomeSwift(const char *name)
 **********************************************************************/
 static void addNamedClass(Class cls, const char *name, Class replacing = nil)
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
     Class old;
     if ((old = getClassExceptSomeSwift(name))  &&  old != replacing) {
         inform_duplicate(name, old, cls);
@@ -2100,7 +2066,7 @@ static void addNamedClass_locked(Class cls, const char *name, Class replacing = 
 **********************************************************************/
 static void removeNamedClass(Class cls, const char *name)
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
     ASSERT(!(cls->bits.safe_ro()->flags & RO_META));
     if (cls == getClassFromNamedClassTable(name)) {
         NXMapRemove(gdb_objc_realized_classes, name);
@@ -2123,7 +2089,7 @@ static NXMapTable *future_named_class_map = nil;
 OBJC_EXTERN void *const _Nonnull objc_debug_future_named_class_map = &future_named_class_map;
 static NXMapTable *futureNamedClasses()
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     if (future_named_class_map) return future_named_class_map;
 
@@ -2149,7 +2115,7 @@ static void addFutureNamedClass(const char *name, Class cls)
 {
     void *old;
 
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     if (PrintFuture) {
         _objc_inform("FUTURE: reserving %p for %s", (void*)cls, name);
@@ -2176,7 +2142,7 @@ static void addFutureNamedClass(const char *name, Class cls)
 **********************************************************************/
 static Class popFutureNamedClass(const char *name)
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     Class cls = nil;
 
@@ -2202,7 +2168,7 @@ static objc::DenseMap<Class, Class> *remappedClasses(bool create)
 {
     static objc::LazyInitDenseMap<Class, Class> remapped_class_map;
 
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     // start big enough to hold CF's classes and a few others
     return remapped_class_map.get(create, 32);
@@ -2216,7 +2182,7 @@ static objc::DenseMap<Class, Class> *remappedClasses(bool create)
 **********************************************************************/
 static bool noClassesRemapped(void)
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     bool result = (remappedClasses(NO) == nil);
 #if DEBUG
@@ -2236,7 +2202,7 @@ static bool noClassesRemapped(void)
 **********************************************************************/
 static void addRemappedClass(Class oldcls, Class newcls)
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     if (PrintFuture) {
         _objc_inform("FUTURE: using %p instead of %p for %s",
@@ -2267,7 +2233,7 @@ static void addRemappedClass(Class oldcls, Class newcls)
 **********************************************************************/
 static Class remapClass(Class cls)
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     if (!cls) return nil;
 
@@ -2298,17 +2264,12 @@ Class _class_remap(Class cls)
 * or is an ignored weak-linked class.
 * Locking: runtimeLock must be read- or write-locked by the caller
 **********************************************************************/
-static void remapClassRef(Class *clsref,
-                          uint32_t objcImageIndex,
-                          _dyld_objc_mark_image_mutable makeImageMutable)
+static void remapClassRef(Class *clsref)
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     Class newcls = remapClass(*clsref);
-    if (*clsref != newcls) {
-        makeImageMutable(objcImageIndex);
-        *clsref = newcls;
-    }
+    if (*clsref != newcls) *clsref = newcls;
 }
 
 
@@ -2340,7 +2301,7 @@ objc_loadClassref(_Nullable Class * _Nonnull clsref)
 static Class getMaybeUnrealizedNonMetaClass(Class metacls, id inst)
 {
     static int total, named, secondary, sharedcache, dyld3;
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
     ASSERT(metacls->isRealized());
 
     total++;
@@ -2506,7 +2467,7 @@ static Class initializeAndLeaveLocked(Class cls, id obj, mutex_t& lock)
 **********************************************************************/
 static void addRootClass(Class cls)
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     ASSERT(cls->isRealized());
 
@@ -2518,7 +2479,7 @@ static void addRootClass(Class cls)
 
 static void removeRootClass(Class cls)
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     objc_debug_realized_class_generation_count++;
 
@@ -2539,7 +2500,7 @@ static void removeRootClass(Class cls)
 **********************************************************************/
 static void addSubclass(Class supercls, Class subcls)
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     if (supercls  &&  subcls) {
         ASSERT(supercls->isRealized());
@@ -2585,7 +2546,7 @@ static void addSubclass(Class supercls, Class subcls)
 **********************************************************************/
 static void removeSubclass(Class supercls, Class subcls)
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
     ASSERT(supercls->isRealized());
     ASSERT(subcls->isRealized());
     ASSERT(subcls->getSuperclass() == supercls);
@@ -2612,7 +2573,7 @@ static NXMapTable *protocols(void)
 {
     static NXMapTable *protocol_map = nil;
 
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     INIT_ONCE_PTR(protocol_map,
                   NXCreateMapTable(NXStrValueMapPrototype, 16),
@@ -2629,7 +2590,7 @@ static NXMapTable *protocols(void)
 **********************************************************************/
 static NEVER_INLINE Protocol *getProtocol(const char *name)
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     // Try name as-is.
     Protocol *result = (Protocol *)NXMapGet(protocols(), name);
@@ -2663,7 +2624,7 @@ static NEVER_INLINE Protocol *getProtocol(const char *name)
 **********************************************************************/
 static ALWAYS_INLINE protocol_t *remapProtocol(protocol_ref_t proto)
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     // Protocols in shared cache images have a canonical bit to mark that they
     // are the definition we should use
@@ -2682,15 +2643,12 @@ static ALWAYS_INLINE protocol_t *remapProtocol(protocol_ref_t proto)
 * Locking: runtimeLock must be read- or write-locked by the caller
 **********************************************************************/
 static size_t UnfixedProtocolReferences;
-static void remapProtocolRef(protocol_t **protoref,
-                             uint32_t objcImageIndex,
-                             _dyld_objc_mark_image_mutable makeImageMutable)
+static void remapProtocolRef(protocol_t **protoref)
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     protocol_t *newproto = remapProtocol((protocol_ref_t)*protoref);
     if (*protoref != newproto) {
-        makeImageMutable(objcImageIndex);
         *protoref = newproto;
         UnfixedProtocolReferences++;
     }
@@ -2705,7 +2663,7 @@ static void remapProtocolRef(protocol_t **protoref,
 **********************************************************************/
 static void moveIvars(class_ro_t *ro, uint32_t superSize)
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     uint32_t diff;
 
@@ -2868,7 +2826,7 @@ static void validateAlreadyRealizedClass(Class cls) {
 **********************************************************************/
 static Class realizeClassWithoutSwift(Class cls, Class previously)
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     class_rw_t *rw;
     Class supercls;
@@ -3072,7 +3030,7 @@ Class _objc_realizeClassFromSwift(Class cls, void *previously)
 **********************************************************************/
 static Class realizeSwiftClass(Class cls)
 {
-    lockdebug::assert_unlocked(&runtimeLock.get());
+    lockdebug::assert_unlocked(&runtimeLock);
 
     // Some assumptions:
     // * Metaclasses never have a Swift initializer.
@@ -3206,7 +3164,7 @@ missingWeakSuperclass(Class cls)
 **********************************************************************/
 static void realizeAllClassesInImage(header_info *hi)
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     size_t count, i;
     classref_t const *classlist;
@@ -3248,7 +3206,7 @@ static void realizeAllClassesInImage(header_info *hi)
 **********************************************************************/
 static void realizeAllClasses(void)
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     // Skip headers until we locate LastHeaderRealizedAllClasses. If it's NULL
     // then we don't skip any.
@@ -3345,7 +3303,7 @@ BOOL _class_isSwift(Class _Nullable cls)
 **********************************************************************/
 static void flushCaches(Class cls, const char *func, bool (^predicate)(Class))
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 #if CONFIG_USE_CACHE_LOCK
     mutex_locker_t lock(cacheUpdateLock);
 #endif
@@ -3424,14 +3382,13 @@ is_root_ramdisk()
 * Locking: write-locks runtimeLock
 **********************************************************************/
 void
-map_images(unsigned count, const struct _dyld_objc_notify_mapped_info infos[],
-           _dyld_objc_mark_image_mutable makeImageMutable)
+map_images(unsigned count, const struct _dyld_objc_notify_mapped_info infos[])
 {
     bool takeEnforcementDisableFault;
 
     {
         mutex_locker_t lock(runtimeLock);
-        map_images_nolock(count, infos, &takeEnforcementDisableFault, makeImageMutable);
+        map_images_nolock(count, infos, &takeEnforcementDisableFault);
     }
 
     if (takeEnforcementDisableFault) {
@@ -3466,10 +3423,7 @@ _objc_map_images(unsigned count, const char * const paths[],
         };
         infos.push_back(info);
     }
-    _dyld_objc_mark_image_mutable makeImageMutable = ^(uint32_t objcImageIndex) {
-        // TODO: Implement this if the JIT ever puts refs in read-only data
-    };
-    map_images(count, infos.data(), makeImageMutable);
+    map_images(count, infos.data());
 }
 
 static void load_categories_nolock(header_info *hi) {
@@ -3924,8 +3878,7 @@ readProtocol(protocol_t *newproto, Class protocol_class,
 *
 * Locking: runtimeLock acquired by map_images
 **********************************************************************/
-void _read_images(mapped_image_info infosParam[], uint32_t hCount, int totalClasses, int unoptimizedTotalClasses,
-                  _dyld_objc_mark_image_mutable makeImageMutable)
+void _read_images(mapped_image_info infosParam[], uint32_t hCount, int totalClasses, int unoptimizedTotalClasses)
 {
     UnsafeSpan<mapped_image_info> infos{infosParam, hCount};
 
@@ -3936,7 +3889,7 @@ void _read_images(mapped_image_info infosParam[], uint32_t hCount, int totalClas
     static bool doneOnce;
     bool launchTime = NO;
 
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     if (!doneOnce) {
         // dtrace probe
@@ -3971,7 +3924,7 @@ void _read_images(mapped_image_info infosParam[], uint32_t hCount, int totalClas
         // (linked before OS X 10.11)
         // Note: we must check for macOS, because Catalyst and Almond apps
         // return false for a Mac SDK check! rdar://78225780
-        if (dyld_get_active_platform() == PLATFORM_MACOS && !dyld_program_sdk_at_least(dyld_platform_version_macOS_10_11)) {
+        if (dyld_get_active_platform() == PLATFORM_MACOS) {
             DisableNonpointerIsa = On;
             if (PrintRawIsa) {
                 _objc_inform("RAW ISA: disabling non-pointer isa because "
@@ -4100,17 +4053,15 @@ void _read_images(mapped_image_info infosParam[], uint32_t hCount, int totalClas
     OBJC_RUNTIME_REMAP_CLASSES_START();
 
     if (!noClassesRemapped()) {
-        for (const auto& info : infos) {
-            // The infos array is reversed, but dyld expects the original index
-            const uint32_t infoIndex = (hCount - 1) - infos.index(&info);
+        for (auto info : infos) {
             Class *classrefs = info.hi->classrefs(&count);
             for (i = 0; i < count; i++) {
-                remapClassRef(&classrefs[i], infoIndex, makeImageMutable);
+                remapClassRef(&classrefs[i]);
             }
             // fixme why doesn't test future1 catch the absence of this?
             classrefs = info.hi->superrefs(&count);
             for (i = 0; i < count; i++) {
-                remapClassRef(&classrefs[i], infoIndex, makeImageMutable);
+                remapClassRef(&classrefs[i]);
             }
         }
     }
@@ -4187,19 +4138,16 @@ void _read_images(mapped_image_info infosParam[], uint32_t hCount, int totalClas
     // dtrace probe
     OBJC_RUNTIME_FIXUP_PROTOCOLS_START();
 
-    for (const auto& info : infos) {
-        // The infos array is reversed, but dyld expects the original index
-        const uint32_t infoIndex = (hCount - 1) - infos.index(&info);
-        if (launchTime && info.hi->isPreoptimized()) {
-            // At launch time, we know preoptimized image refs are pointing at the
-            // shared cache definition of a protocol.  We can skip the check on
-            // launch, but have to visit @protocol refs for shared cache images
-            // loaded later.
-        } else {
-            protocol_t **protolist = info.hi->protocolrefs(&count);
-            for (i = 0; i < count; i++) {
-              remapProtocolRef(&protolist[i], infoIndex, makeImageMutable);
-            }
+    for (auto info : infos) {
+        // At launch time, we know preoptimized image refs are pointing at the
+        // shared cache definition of a protocol.  We can skip the check on
+        // launch, but have to visit @protocol refs for shared cache images
+        // loaded later.
+        if (launchTime && info.hi->isPreoptimized())
+            continue;
+        protocol_t **protolist = info.hi->protocolrefs(&count);
+        for (i = 0; i < count; i++) {
+            remapProtocolRef(&protolist[i]);
         }
     }
 
@@ -4215,25 +4163,8 @@ void _read_images(mapped_image_info infosParam[], uint32_t hCount, int totalClas
     OBJC_RUNTIME_DISCOVER_CATEGORIES_START();
 
     if (didInitialAttachCategories) {
-        // We attach categories in two phases: first images with preattached
-        // categories, then images without. We need to avoid this scenario:
-        // 1. Class C still has a preattached categories list.
-        // 2. Library A has a non-preattached category on C. We copy C's
-        //    preattached lists to the heap and append A's list.
-        // 3. Library B has a preattached category on C. Because C no longer
-        //    has preattached lists, we append B's list.
-        // Step 2 already copied B's list, so we end up with two copies of it.
-        // This is usually mostly harmless (just a performance issue) but it
-        // can cause real problems for code using class_copyMethodList or
-        // similar, as it will see two copies of the entries in the duplicate
-        // list.
         for (auto info : infos) {
-            if (info.dyldCategoriesOptimized())
-                load_categories_nolock(info.hi);
-        }
-        for (auto info : infos) {
-            if (!info.dyldCategoriesOptimized())
-                load_categories_nolock(info.hi);
+            load_categories_nolock(info.hi);
         }
     }
 
@@ -4407,7 +4338,7 @@ void prepare_load_methods(const headerType *mhdr, const _dyld_section_location_i
 {
     size_t count, i;
 
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     classref_t const *classlist = getSectionData<classref_t>(mhdr, info, _dyld_section_location_data_non_lazy_class_list, &count);
     for (i = 0; i < count; i++) {
@@ -4440,8 +4371,8 @@ void _unload_image(header_info *hi)
 {
     size_t count, i;
 
-    lockdebug::assert_locked(&loadMethodLock.get());
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&loadMethodLock);
+    lockdebug::assert_locked(&runtimeLock);
 
     // Unload unattached categories and categories waiting for +load.
 
@@ -4571,7 +4502,7 @@ method_getTypeEncoding(Method mSigned)
 static IMP
 _method_setImplementation(Class cls, method_t *m, IMP imp)
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     if (!m) return nil;
     if (!imp) return nil;
@@ -4783,7 +4714,7 @@ static void
 fixupProtocolMethodList(protocol_t *proto, method_list_t *mlist,
                         bool required, bool instance)
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     if (!mlist) return;
     if (mlist->isFixedUp()) return;
@@ -4822,7 +4753,7 @@ fixupProtocolMethodList(protocol_t *proto, method_list_t *mlist,
 static void
 fixupProtocol(protocol_t *proto)
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     if (proto->protocols) {
         for (uintptr_t i = 0; i < proto->protocols->count; i++) {
@@ -4842,17 +4773,18 @@ fixupProtocol(protocol_t *proto)
 
 
 /***********************************************************************
-* fixupProtocolIfNeeded_nolock
+* fixupProtocolIfNeeded
 * Fixes up all of a protocol's method lists if they aren't fixed up already.
-* Locking: runtimeLock must be held.
+* Locking: write-locks runtimeLock.
 **********************************************************************/
 static void
-fixupProtocolIfNeeded_nolock(protocol_t *proto)
+fixupProtocolIfNeeded(protocol_t *proto)
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_unlocked(&runtimeLock);
     ASSERT(proto);
 
     if (!proto->isFixedUp()) {
+        mutex_locker_t lock(runtimeLock);
         fixupProtocol(proto);
     }
 }
@@ -4889,7 +4821,7 @@ protocol_getMethod_nolock(protocol_t *proto, SEL sel,
                           bool isRequiredMethod, bool isInstanceMethod,
                           bool recursive)
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     if (!proto  ||  !sel) return nil;
 
@@ -4926,9 +4858,9 @@ Method
 protocol_getMethod(protocol_t *proto, SEL sel, bool isRequiredMethod, bool isInstanceMethod, bool recursive)
 {
     if (!proto) return nil;
+    fixupProtocolIfNeeded(proto);
 
     mutex_locker_t lock(runtimeLock);
-    fixupProtocolIfNeeded_nolock(proto);
     return _method_sign(protocol_getMethod_nolock(proto, sel, isRequiredMethod,
                                                   isInstanceMethod, recursive));
 }
@@ -4945,7 +4877,7 @@ protocol_getMethodTypeEncoding_nolock(protocol_t *proto, SEL sel,
                                       bool isRequiredMethod,
                                       bool isInstanceMethod)
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     if (!proto) return nil;
     ASSERT(proto->isFixedUp());
@@ -4989,9 +4921,9 @@ _protocol_getMethodTypeEncoding(Protocol *proto_gen, SEL sel,
     protocol_t *proto = newprotocol(proto_gen);
 
     if (!proto) return nil;
+    fixupProtocolIfNeeded(proto);
 
     mutex_locker_t lock(runtimeLock);
-    fixupProtocolIfNeeded_nolock(proto);
     return protocol_getMethodTypeEncoding_nolock(proto, sel,
                                                  isRequiredMethod,
                                                  isInstanceMethod);
@@ -5061,7 +4993,7 @@ protocol_getMethodDescription(Protocol *p, SEL aSel,
 static bool
 protocol_conformsToProtocol_nolock(protocol_t *self, protocol_t *other)
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     if (!self  ||  !other) {
         return NO;
@@ -5142,9 +5074,9 @@ protocol_copyMethodDescriptionList(Protocol *p,
         return nil;
     }
 
-    mutex_locker_t lock(runtimeLock);
+    fixupProtocolIfNeeded(proto);
 
-    fixupProtocolIfNeeded_nolock(proto);
+    mutex_locker_t lock(runtimeLock);
 
     method_list_t *mlist =
         getProtocolMethodList(proto, isRequiredMethod, isInstanceMethod);
@@ -5173,7 +5105,7 @@ static property_t *
 protocol_getProperty_nolock(protocol_t *proto, const char *name,
                             bool isRequiredProperty, bool isInstanceProperty)
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     if (!isRequiredProperty) {
         // Only required properties are currently supported.
@@ -5759,7 +5691,7 @@ bool
 _classConformsToProtocol_unrealized(Class _Nonnull cls,
                                     Protocol * _Nonnull protocol)
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     protocol_t *proto = newprotocol(protocol);
     protocol_array_t protocols;
@@ -6240,7 +6172,7 @@ _category_getName(Category cat)
 const char *
 _category_getClassName(Category cat)
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
     return remapClass(cat->cls)->nameForLogging();
 }
 
@@ -6365,7 +6297,7 @@ const char **objc_copyImageNames(unsigned int *outCount)
 const char **
 copyClassNamesForImage_nolock(header_info *hi, unsigned int *outCount)
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
     ASSERT(hi);
 
     size_t count;
@@ -6392,7 +6324,7 @@ copyClassNamesForImage_nolock(header_info *hi, unsigned int *outCount)
 Class *
 copyClassesForImage_nolock(header_info *hi, unsigned int *outCount)
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
     ASSERT(hi);
 
     size_t count;
@@ -6633,13 +6565,13 @@ objc_class::nameForLogging()
 * If realize=false, the class must already be realized or future.
 * Locking: runtimeLock may or may not be held by the caller.
 **********************************************************************/
-ExplicitInitLock<mutex_t> DemangleCacheLock;
+mutex_t DemangleCacheLock;
 static objc::DenseSet<const char *> *DemangleCache;
 const char *
 objc_class::demangledName(bool needsLock)
 {
     if (!needsLock) {
-        lockdebug::assert_locked(&runtimeLock.get());
+        lockdebug::assert_locked(&runtimeLock);
     }
 
     // Return previously demangled name if available.
@@ -6951,7 +6883,7 @@ _getLoadMethod(const method_list_t *mlist)
 NEVER_INLINE IMP
 objc_class::getLoadMethod()
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     ASSERT(isRealized());
     ASSERT(ISA()->isRealized());
@@ -6981,7 +6913,7 @@ objc_class::getLoadMethod()
 NEVER_INLINE IMP
 _category_getLoadMethod(Category cat)
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     return _getLoadMethod(cat->classMethods);
 }
@@ -7060,7 +6992,7 @@ static method_t *getMethodFromListArray(MethodListPointer array, unsigned count,
 static method_t *
 getMethodNoSuper_nolock(Class cls, SEL sel)
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     ASSERT(cls->isRealized());
     // fixme nil cls?
@@ -7098,7 +7030,7 @@ getMethod_nolock(Class cls, SEL sel)
 {
     method_t *m = nil;
 
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     // fixme nil cls?
     // fixme nil sel?
@@ -7157,7 +7089,7 @@ Method class_getInstanceMethod(Class cls, SEL sel)
 **********************************************************************/
 static void resolveClassMethod(id inst, SEL sel, Class cls)
 {
-    lockdebug::assert_unlocked(&runtimeLock.get());
+    lockdebug::assert_unlocked(&runtimeLock);
     ASSERT(cls->isRealized());
     ASSERT(cls->isMetaClass());
 
@@ -7210,7 +7142,7 @@ static void resolveClassMethod(id inst, SEL sel, Class cls)
 **********************************************************************/
 static void resolveInstanceMethod(id inst, SEL sel, Class cls)
 {
-    lockdebug::assert_unlocked(&runtimeLock.get());
+    lockdebug::assert_unlocked(&runtimeLock);
     ASSERT(cls->isRealized());
     SEL resolve_sel = @selector(resolveInstanceMethod:);
 
@@ -7255,7 +7187,7 @@ static void resolveInstanceMethod(id inst, SEL sel, Class cls)
 static NEVER_INLINE IMP
 resolveMethod_locked(id inst, SEL sel, Class cls, int behavior)
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
     ASSERT(cls->isRealized());
 
     runtimeLock.unlock();
@@ -7312,7 +7244,7 @@ log_and_fill_cache(Class cls, IMP imp, SEL sel, id receiver, Class implementer)
 static Class
 realizeAndInitializeIfNeeded_locked(id inst, Class cls, bool initialize)
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
     if (slowpath(!cls->isRealized())) {
         cls = realizeClassMaybeSwiftAndLeaveLocked(cls, runtimeLock);
         // runtimeLock may have been dropped but is now locked again
@@ -7349,7 +7281,7 @@ realizeAndInitializeIfNeeded_locked(id inst, Class cls, bool initialize)
 ALWAYS_INLINE
 static IMP _lookUpImpTryCache(id inst, SEL sel, Class cls, int behavior)
 {
-    lockdebug::assert_unlocked(&runtimeLock.get());
+    lockdebug::assert_unlocked(&runtimeLock);
 
     if (slowpath(!cls->isInitialized())) {
         // see comment in lookUpImpOrForward
@@ -7394,7 +7326,7 @@ IMP lookUpImpOrForward(id inst, SEL sel, Class cls, int behavior)
     IMP imp = nil;
     Class curClass;
 
-    lockdebug::assert_unlocked(&runtimeLock.get());
+    lockdebug::assert_unlocked(&runtimeLock);
 
     if (slowpath(!cls->isInitialized())) {
         // The first message sent to a class is often +new or +alloc, or +self
@@ -7434,7 +7366,7 @@ IMP lookUpImpOrForward(id inst, SEL sel, Class cls, int behavior)
 
     cls = realizeAndInitializeIfNeeded_locked(inst, cls, behavior & LOOKUP_INITIALIZE);
     // runtimeLock may have been dropped but is now locked again
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
     curClass = cls;
 
     // The code used to lookup the class's cache again right after
@@ -7663,7 +7595,7 @@ objc_class::printInstancesRequireRawIsa(bool inherited)
 void objc_class::setInstancesRequireRawIsaRecursively(bool inherited)
 {
     Class cls = (Class)this;
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     if (instancesRequireRawIsa()) return;
 
@@ -7683,7 +7615,7 @@ void objc_class::setInstancesRequireRawIsaRecursively(bool inherited)
 void objc_class::setDisallowPreoptCachesRecursively(const char *why)
 {
     Class cls = (Class)this;
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     if (!allowsPreoptCaches()) return;
 
@@ -7709,7 +7641,7 @@ void objc_class::setDisallowPreoptCachesRecursively(const char *why)
 void objc_class::setDisallowPreoptInlinedSelsRecursively(const char *why)
 {
     Class cls = (Class)this;
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     if (!allowsPreoptInlinedSels()) return;
 
@@ -7741,7 +7673,7 @@ void objc_class::chooseClassArrayIndex()
 {
 #if SUPPORT_INDEXED_ISA
     Class cls = (Class)this;
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     if (objc_indexed_classes_count >= ISA_INDEX_COUNT) {
         // No more indexes available.
@@ -7936,7 +7868,7 @@ class_setWeakIvarLayout(Class cls, const uint8_t *layout)
 **********************************************************************/
 static ivar_t *getIvar(Class cls, const char *name)
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     const ivar_list_t *ivars;
     ASSERT(cls->isRealized());
@@ -8057,7 +7989,7 @@ addMethod(Class cls, SEL name, IMP imp, const char *types, bool replace)
 {
     IMP result = nil;
 
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     checkIsKnownClass(cls);
 
@@ -8104,7 +8036,7 @@ static SEL *
 addMethods(Class cls, const SEL *names, const IMP *imps, const char **types,
            uint32_t count, bool replace, uint32_t *outFailedCount)
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     ASSERT(names);
     ASSERT(imps);
@@ -8550,7 +8482,7 @@ static const uint8_t UnsetLayout = 0;
 
 static void objc_initializeClassPair_internal(Class superclass, const char *name, Class cls, Class meta)
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     class_ro_t *cls_ro_w, *meta_ro_w;
     class_rw_t *cls_rw_w, *meta_rw_w;
@@ -8810,7 +8742,7 @@ Class objc_readClassPair(Class bits, const struct objc_image_info *info)
 **********************************************************************/
 static void detach_class(Class cls, bool isMeta)
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     // categories not yet attached to this class
     objc::unattachedCategories.eraseClass(cls);
@@ -8841,7 +8773,7 @@ static void detach_class(Class cls, bool isMeta)
 **********************************************************************/
 static void free_class(Class cls)
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     if (! cls->isRealized()) return;
 
@@ -9353,7 +9285,7 @@ initializeTaggedPointerObfuscator(void)
 {
     if (!DisableTaggedPointerObfuscation
 #if !TARGET_OS_EXCLAVEKIT
-        && dyld_program_sdk_at_least(dyld_fall_2018_os_versions)
+//        && dyld_program_sdk_at_least(dyld_fall_2018_os_versions)
 #endif
         ) {
         // Pull random data into the variable, then shift away all non-payload bits.
@@ -9441,13 +9373,6 @@ _objc_getClassForTag(objc_tag_index_t tag)
 #endif
 
 
-void *
-_calloc_canonical(size_t size)
-{
-    return calloc(1, size);
-}
-
-
 #if SUPPORT_FIXUP
 
 OBJC_EXTERN void objc_msgSend_fixup(void);
@@ -9527,7 +9452,7 @@ static Class setSuperclass(Class cls, Class newSuper)
 {
     Class oldSuper;
 
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     ASSERT(cls->isRealized());
     ASSERT(newSuper->isRealized());

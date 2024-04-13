@@ -34,7 +34,6 @@
 #include <TargetConditionals.h>
 #include "objc-config.h"
 #include "objc-private.h"
-#include "objc-ptrauth.h"
 #include "objc-vm.h"
 
 #ifdef __LP64__
@@ -70,18 +69,16 @@ class nocopy_t {
 // Version of std::atomic that does not allow implicit conversions
 // to/from the wrapped type, and requires an explicit memory order
 // be passed to load() and store().
-template <typename T, typename Ptrauth = PtrauthRaw>
+template <typename T>
 struct explicit_atomic : public std::atomic<T> {
     explicit explicit_atomic(T initial) noexcept : std::atomic<T>(std::move(initial)) {}
     operator T() const = delete;
     
     T load(std::memory_order order) const noexcept {
-        T value = std::atomic<T>::load(order);
-        return Ptrauth::auth(value, this);
+        return std::atomic<T>::load(order);
     }
     void store(T desired, std::memory_order order) noexcept {
-        T value = Ptrauth::sign(desired, this);
-        std::atomic<T>::store(value, order);
+        std::atomic<T>::store(desired, order);
     }
     
     // Convert a normal pointer to an atomic pointer. This is a

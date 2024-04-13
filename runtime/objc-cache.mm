@@ -83,8 +83,8 @@
 
 #if TARGET_OS_OSX
 #   if !TARGET_OS_EXCLAVEKIT
-#include <Cambria/Traps.h>
-#include <Cambria/Cambria.h>
+//#include <Cambria/Traps.h>
+//#include <Cambria/Cambria.h>
 #   endif
 #endif
 
@@ -234,7 +234,7 @@ asm("\n .section __TEXT,__const"
 
 #if CONFIG_USE_PREOPT_CACHES
 __attribute__((used, section("__DATA_CONST,__objc_scoffs")))
-const int objc_opt_preopt_caches_version = 4;
+const int objc_opt_preopt_caches_version = 3;
 __attribute__((used, section("__DATA_CONST,__objc_scoffs")))
 const uintptr_t objc_opt_offsets[__OBJC_OPT_OFFSETS_COUNT] = {0};
 #endif
@@ -382,12 +382,6 @@ void cache_t::initializeToEmpty()
 }
 
 #if CONFIG_USE_PREOPT_CACHES
-
-static uint32_t disguisedPreoptCacheSignature(const bucket_t *disguised, const cache_t *cache) {
-    uintptr_t signature = ptrauth_sign_generic_data(disguised, cache);
-    return (uint32_t)signature ^ (uint32_t)(signature >> 32);
-}
-
 /*
  * The shared cache builder will sometimes have prebuilt an IMP cache
  * for the class and left a `preopt_cache_t` pointer in _originalPreoptCache.
@@ -422,11 +416,9 @@ void cache_t::initializeToPreoptCacheInDisguise(const preopt_cache_t *cache)
 
     uintptr_t value = (uintptr_t)cache + sizeof(preopt_cache_t) -
             (bucket_t::offsetOfSel() + sizeof(SEL));
-    bucket_t *disguised = (bucket_t *)value;
 
     _originalPreoptCache.store(nullptr, std::memory_order_relaxed);
-    setBucketsAndMask(disguised, 0);
-    _disguisedPreoptCacheSignature = disguisedPreoptCacheSignature(disguised, this);
+    setBucketsAndMask((bucket_t *)value, 0);
     _occupied = cache->occupied;
 }
 
@@ -461,49 +453,25 @@ void cache_t::maybeConvertToPreoptimized()
 void cache_t::initializeToEmptyOrPreoptimizedInDisguise()
 {
     if (os_fastpath(!DisablePreoptCaches)) {
+        // TODO: we really only want to disallow preoptimized caches in the
+        // presence of roots if `this` is outside the shared cache, or if `this`
+        // is an inside-out patched class. But detecting an inside-out patched
+        // class is trivial. Disable them all for now, until we figure out how
+        // to detect those.
+        if (dyld_shared_cache_some_image_overridden()) {
+            // If the system has roots, then we must disable preoptimized
+            // caches completely. If a class in another image has a
+            // superclass in the root, the offset to the superclass will
+            // be wrong. rdar://problem/61601961
+            cls()->setDisallowPreoptCachesRecursively("roots");
+        }
+
         if (!objc::dataSegmentsRanges.inSharedCache((uintptr_t)this)) {
             return initializeToEmpty();
         }
 
         auto cache = _originalPreoptCache.load(memory_order_relaxed);
         if (cache) {
-            // When roots are installed, then the class's preoptimized cache
-            // might not be valid. This is the case if the fallback class is
-            // in a root, or if any class between this class and the fallback
-            // is in a root. Note, this class cannot itself be in a root,
-            // because a class in a root can't have a preoptimized cache in the
-            // first place.
-            //
-            // "In a root" needs to include inside-out patched classes which are
-            // physically in the shared cache but conceptually in a root.
-            // objc::classInSharedCache knows how to check for that.
-            if (dyld_shared_cache_some_image_overridden()) {
-                // If there's a fallback class, then we need to check it and the
-                // intermediate classes. If not, then the preoptimized cache is
-                // good.
-                if (cache->fallback_class_offset) {
-                    Class fallback = (Class)((intptr_t)cls() + cache->fallback_class_offset);
-
-                    // Iterate through the superclasses until we find `fallback`
-                    // or we go off the end. We'll go off the end if the
-                    // fallback class is in a root and is not inside-out
-                    // patched, because `fallback` will point to the original.
-                    Class intermediate = cls();
-                    do {
-                        intermediate = intermediate->getSuperclass();
-
-                        // If we never found `fallback`, or we found a class
-                        // not in the shared cache, then this preoptimized cache
-                        // is no good.
-                        if (!intermediate || !objc::classInSharedCache(intermediate)) {
-                            initializeToEmpty();
-                            cls()->setDisallowPreoptCachesRecursively("roots");
-                            return;
-                        }
-                    } while (intermediate != fallback);
-                }
-            }
-
             return initializeToPreoptCacheInDisguise(cache);
         }
     }
@@ -531,10 +499,6 @@ const preopt_cache_t *cache_t::disguised_preopt_cache() const
 {
     bucket_t *b = buckets();
     if ((intptr_t)b->sel() >= 0) return nil;
-
-    uint32_t signature = disguisedPreoptCacheSignature(b, this);
-    if (slowpath(_disguisedPreoptCacheSignature != signature))
-        __builtin_trap();
 
     uintptr_t value = (uintptr_t)b + bucket_t::offsetOfSel() + sizeof(SEL);
     return (preopt_cache_t *)(value - sizeof(preopt_cache_t));
@@ -701,11 +665,6 @@ size_t cache_t::bytesForCapacity(uint32_t cap)
     return sizeof(bucket_t) * cap;
 }
 
-bucket_t *cache_t::mallocBuckets(mask_t newCapacity)
-{
-    return (bucket_t *)_calloc_canonical(bytesForCapacity(newCapacity));
-}
-
 #if CACHE_END_MARKER
 
 bucket_t *cache_t::endMarker(struct bucket_t *b, uint32_t cap)
@@ -717,7 +676,7 @@ bucket_t *cache_t::allocateBuckets(mask_t newCapacity)
 {
     // Allocate one extra bucket to mark the end of the list.
     // This can't overflow mask_t because newCapacity is a power of 2.
-    bucket_t *newBuckets = mallocBuckets(newCapacity);
+    bucket_t *newBuckets = (bucket_t *)calloc(bytesForCapacity(newCapacity), 1);
 
     bucket_t *end = endMarker(newBuckets, newCapacity);
 
@@ -741,7 +700,7 @@ bucket_t *cache_t::allocateBuckets(mask_t newCapacity)
 {
     if (PrintCaches) recordNewCache(newCapacity);
 
-    return mallocBuckets(newCapacity);
+    return (bucket_t *)calloc(bytesForCapacity(newCapacity), 1);
 }
 
 #endif
@@ -756,7 +715,7 @@ bucket_t *cache_t::emptyBucketsForCapacity(mask_t capacity, bool allocate)
 #if CONFIG_USE_CACHE_LOCK
     lockdebug::assert_locked(&cacheUpdateLock);
 #else
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 #endif
 
     size_t bytes = bytesForCapacity(capacity);
@@ -776,7 +735,7 @@ bucket_t *cache_t::emptyBucketsForCapacity(mask_t capacity, bool allocate)
         if (!allocate) return nil;
 
         mask_t newListCount = index + 1;
-        bucket_t *newBuckets = mallocBuckets(capacity);
+        bucket_t *newBuckets = (bucket_t *)calloc(bytes, 1);
         emptyBucketsList = (bucket_t**)
             realloc(emptyBucketsList, newListCount * sizeof(bucket_t *));
         // Share newBuckets for every un-allocated size smaller than index.
@@ -874,7 +833,7 @@ void cache_t::bad_cache(id receiver, SEL sel)
 
 void cache_t::insert(SEL sel, IMP imp, id receiver)
 {
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 
     // Never cache before +initialize is done
     if (slowpath(!cls()->isInitialized())) {
@@ -948,7 +907,7 @@ void cache_t::copyCacheNolock(objc_imp_cache_entry *buffer, int len)
 #if CONFIG_USE_CACHE_LOCK
     lockdebug::assert_locked(&cacheUpdateLock);
 #else
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 #endif
     int wpos = 0;
 
@@ -991,7 +950,7 @@ void cache_t::eraseNolock(const char *func)
 #if CONFIG_USE_CACHE_LOCK
     lockdebug::assert_locked(&cacheUpdateLock);
 #else
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 #endif
 
     if (isConstantOptimizedCache()) {
@@ -1019,7 +978,7 @@ void cache_t::destroy()
 #if CONFIG_USE_CACHE_LOCK
     mutex_locker_t lock(cacheUpdateLock);
 #else
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 #endif
     if (canBeFreed()) {
         if (PrintCaches) recordDeadCache(capacity());
@@ -1115,7 +1074,7 @@ void cache_t::init()
 
     cache_t testCache;
     testCache._originalPreoptCache.store((preopt_cache_t *)maxPtr, std::memory_order_relaxed);
-    ASSERT((testCache._flags & FAST_CACHE_FLAGS_MASK) == 0);
+    ASSERT(testCache._flags == 0);
 #endif
 
 #if HAVE_TASK_RESTARTABLE_RANGES
@@ -1185,14 +1144,16 @@ static int _collecting_in_critical(void)
 
         // Find out where thread is executing
 #if TARGET_OS_OSX
-        if (oah_is_current_process_translated()) {
-            kern_return_t ret = objc_thread_get_rip(threads[count], (uint64_t*)&pc);
-            if (ret != KERN_SUCCESS) {
-                pc = PC_SENTINEL;
-            }
-        } else {
-            pc = _get_pc_for_thread (threads[count]);
-        }
+//        if (oah_is_current_process_translated()) {
+//            kern_return_t ret = objc_thread_get_rip(threads[count], (uint64_t*)&pc);
+//            if (ret != KERN_SUCCESS) {
+//                pc = PC_SENTINEL;
+//            }
+//        } else {
+//            pc = _get_pc_for_thread (threads[count]);
+//        }
+        pc = _get_pc_for_thread (threads[count]);
+
 #else
         pc = _get_pc_for_thread (threads[count]);
 #endif
@@ -1293,7 +1254,7 @@ void cache_t::collect_free(bucket_t *data, mask_t capacity)
 #if CONFIG_USE_CACHE_LOCK
     lockdebug::assert_locked(&cacheUpdateLock);
 #else
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 #endif
 
     if (PrintCaches) recordDeadCache(capacity);
@@ -1315,7 +1276,7 @@ void cache_t::collectNolock(bool collectALot)
 #if CONFIG_USE_CACHE_LOCK
     lockdebug::assert_locked(&cacheUpdateLock);
 #else
-    lockdebug::assert_locked(&runtimeLock.get());
+    lockdebug::assert_locked(&runtimeLock);
 #endif
 
     // Done if the garbage is not full

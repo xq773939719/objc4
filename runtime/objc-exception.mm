@@ -1237,4 +1237,4 @@ void exception_init(void)
 
 
 // Define this everywhere even if it isn't used, to simplify fork() safety code
-ExplicitInitLock<mutex_t> AltHandlerDebugLock;
+mutex_t AltHandlerDebugLock;

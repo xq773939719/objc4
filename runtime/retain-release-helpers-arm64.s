@@ -308,12 +308,12 @@ Lretry_release_\reg:
 
 #if USE_CAS
 	mov \casReg, p16
-	casl p16, p17, [\reg] // Try to store the updated value. Store-release to match the acquire barrier when initiating dealloc.
+	cas p16, p17, [\reg] // Try to store the updated value.
 	cmp \casReg, p16
 	b.ne Lretry_release_\reg // On failure, retry. p16 has been loaded with the latest value.
 #else
 	// Store the new isa into the object.
-	stlxr w16, p17, [\reg] // Try to store the updated value. Store-release to match the acquire barrier when initiating dealloc.
+	stxr w16, p17, [\reg] // Try to store the updated value.
 	cbnz w16, Lretry_release_\reg // On failure, retry.
 #endif
 
@@ -326,9 +326,6 @@ Lretry_release_\reg:
 Ldealloc_\reg:
 	// Successfully stored a deallocating isa into the object. Send dealloc
 	// or _objc_initiateDealloc.
-
-	// Acquire barrier to match the store-release above.
-	dmb ishld
 
 	// At this point, we have:
 	//   Masked isa in maskedIsaReg.

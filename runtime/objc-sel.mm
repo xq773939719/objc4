@@ -52,7 +52,7 @@ void sel_init(size_t selrefCount)
 
 static SEL sel_alloc(const char *name, bool copy)
 {
-    lockdebug::assert_locked(&selLock.get());
+    lockdebug::assert_locked(&selLock);
     return (SEL)(copy ? strdupIfMutable(name) : name);
 }
 
@@ -102,8 +102,8 @@ static SEL __sel_registerName(const char *name, bool shouldLock, bool copy)
 {
     SEL result = 0;
 
-    if (shouldLock) lockdebug::assert_unlocked(&selLock.get());
-    else            lockdebug::assert_locked(&selLock.get());
+    if (shouldLock) lockdebug::assert_unlocked(&selLock);
+    else            lockdebug::assert_locked(&selLock);
 
     if (!name) return (SEL)0;
 

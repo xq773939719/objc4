@@ -24,7 +24,6 @@
 #include <string.h>
 #include <stddef.h>
 
-#include "InitWrappers.h"
 #include "objc-private.h"
 #include "runtime.h"
 
@@ -38,15 +37,9 @@
 - (id)mutableCopyWithZone:(void *)zone;
 @end
 
-objc::ExplicitInit<StripedMap<spinlock_t>> PropertyLocks;
-objc::ExplicitInit<StripedMap<spinlock_t>> StructLocks;
-objc::ExplicitInit<StripedMap<spinlock_t>> CppObjectLocks;
-
-void accessors_init(void) {
-    PropertyLocks.init();
-    StructLocks.init();
-    CppObjectLocks.init();
-}
+StripedMap<spinlock_t> PropertyLocks;
+StripedMap<spinlock_t> StructLocks;
+StripedMap<spinlock_t> CppObjectLocks;
 
 #define MUTABLE_COPY 2
 
@@ -60,7 +53,7 @@ id objc_getProperty(id self, SEL _cmd, ptrdiff_t offset, BOOL atomic) {
     if (!atomic) return *slot;
         
     // Atomic retain release world
-    spinlock_t& slotlock = PropertyLocks.get()[slot];
+    spinlock_t& slotlock = PropertyLocks[slot];
     slotlock.lock();
     id value = objc_retain(*slot);
     slotlock.unlock();
@@ -95,7 +88,7 @@ static inline void reallySetProperty(id self, SEL _cmd, id newValue, ptrdiff_t o
         oldValue = *slot;
         *slot = newValue;
     } else {
-        spinlock_t& slotlock = PropertyLocks.get()[slot];
+        spinlock_t& slotlock = PropertyLocks[slot];
         slotlock.lock();
         oldValue = *slot;
         *slot = newValue;        
@@ -141,8 +134,8 @@ void objc_copyStruct(void *dest, const void *src, ptrdiff_t size, BOOL atomic, B
     spinlock_t *srcLock = nil;
     spinlock_t *dstLock = nil;
     if (atomic) {
-        srcLock = &StructLocks.get()[src];
-        dstLock = &StructLocks.get()[dest];
+        srcLock = &StructLocks[src];
+        dstLock = &StructLocks[dest];
         spinlock_t::lockTwo(srcLock, dstLock);
     }
 
@@ -154,8 +147,8 @@ void objc_copyStruct(void *dest, const void *src, ptrdiff_t size, BOOL atomic, B
 }
 
 void objc_copyCppObjectAtomic(void *dest, const void *src, void (*copyHelper) (void *dest, const void *source)) {
-    spinlock_t *srcLock = &CppObjectLocks.get()[src];
-    spinlock_t *dstLock = &CppObjectLocks.get()[dest];
+    spinlock_t *srcLock = &CppObjectLocks[src];
+    spinlock_t *dstLock = &CppObjectLocks[dest];
     spinlock_t::lockTwo(srcLock, dstLock);
 
     // let C++ code perform the actual copy.
